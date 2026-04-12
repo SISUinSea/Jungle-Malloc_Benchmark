@@ -1,0 +1,3 @@
+alias,repo_url,branch,mm_path,enabled
+
+haegeon,https://github.com/SISUinSea/Jungle-Malloc_Lab,main,malloc-lab/mm.c,true
