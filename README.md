@@ -7,7 +7,7 @@
 - 각 참가자의 repo를 clone/fetch/pull 한다.
 - 각 참가자의 `malloc-lab` 작업 디렉터리를 별도 실행 디렉터리에 복사한다.
 - `make clean && make && ./mdriver -v -g` 를 반복 실행한다.
-- `correct`, `perfidx`, `Total util`, `Total Kops`를 집계한다.
+- `correct`, `score`, `perfidx`, `Total util`, `Total Kops`를 집계한다.
 - 기준 harness와 `mdriver.c`, `config.h`, `Makefile`, support files, `traces/` 차이도 검사한다.
 
 `strict` 모드도 지원한다.
@@ -65,6 +65,12 @@ python3 scripts/run_benchmarks.py --mode strict
 python3 scripts/run_benchmarks.py --repeat 5
 ```
 
+느린 구현이나 무한 루프처럼 보이는 구현 때문에 `mdriver`가 오래 걸릴 때는 timeout 조정:
+
+```bash
+python3 scripts/run_benchmarks.py --run-timeout 20 --build-timeout 30
+```
+
 harness 차이가 있으면 경고만 하지 말고 바로 실패 처리:
 
 ```bash
@@ -107,10 +113,13 @@ python3 scripts/summarize_results.py --run-dir runs/20260412-120000
 - correct
 - util(%)
 - Kops
+- score
 - perfidx
 - branch
 - commit
 - repo_url
+
+`score` 는 현재 `config.h`의 `UTIL_WEIGHT`, `AVG_LIBC_THRUPUT` 기준으로 계산되는 점수이며, `perfidx`와 같은 값이다.
 
 ## 상태값
 
@@ -138,4 +147,3 @@ python3 scripts/summarize_results.py --run-dir runs/20260412-120000
 - 원본 `malloc_lab_docker` 리포는 참조용이다.
 - 이 도구는 원본 리포 안에서 빌드하지 않는다.
 - clone 자체에서도 빌드하지 않고, 항상 `runs/` 아래의 복사본에서 실행한다.
-

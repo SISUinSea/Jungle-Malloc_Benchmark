@@ -21,6 +21,7 @@ PERFIDX_RE = re.compile(r"^perfidx:([0-9.]+)\s*$")
 PERF_LINE_RE = re.compile(
     r"^Perf index = ([0-9.]+) \(util\) \+ ([0-9.]+) \(thru\) = ([0-9.]+)/100\s*$"
 )
+DEFINE_RE = re.compile(r"^\s*#define\s+([A-Z0-9_]+)\s+([^\s/]+)")
 
 
 class BenchmarkError(RuntimeError):
@@ -73,13 +74,42 @@ def command_string(args: Iterable[str]) -> str:
     return shlex.join(list(args))
 
 
-def run_command(args: List[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        capture_output=True,
-    )
+def _normalize_subprocess_output(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_command(
+    args: List[str],
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    timeout_seconds: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = _normalize_subprocess_output(exc.stdout)
+        stderr = _normalize_subprocess_output(exc.stderr)
+        timeout_note = "command timed out after {} seconds".format(timeout_seconds)
+        if stderr:
+            stderr = stderr.rstrip() + "\n" + timeout_note
+        else:
+            stderr = timeout_note
+        completed = subprocess.CompletedProcess(
+            args=args,
+            returncode=124,
+            stdout=stdout,
+            stderr=stderr,
+        )
     if check and completed.returncode != 0:
         raise BenchmarkError(
             "command failed: {}\nstdout:\n{}\nstderr:\n{}".format(
@@ -346,6 +376,32 @@ def parse_default_trace_count(config_path: Path) -> int:
     return count
 
 
+def parse_score_config(config_path: Path) -> Dict[str, float]:
+    macros: Dict[str, float] = {}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("/*", 1)[0].strip()
+        match = DEFINE_RE.match(line)
+        if not match:
+            continue
+        name, value = match.groups()
+        if name not in {"AVG_LIBC_THRUPUT", "UTIL_WEIGHT"}:
+            continue
+        try:
+            macros[name] = float(value)
+        except ValueError as exc:
+            raise BenchmarkError("failed to parse {} from {}".format(name, config_path)) from exc
+    if "AVG_LIBC_THRUPUT" not in macros or "UTIL_WEIGHT" not in macros:
+        raise BenchmarkError("failed to read score configuration from {}".format(config_path))
+    avg_libc_throughput_kops = macros["AVG_LIBC_THRUPUT"] / 1000.0
+    util_weight = macros["UTIL_WEIGHT"]
+    return {
+        "util_weight": util_weight,
+        "throughput_weight": 1.0 - util_weight,
+        "avg_libc_throughput_ops": macros["AVG_LIBC_THRUPUT"],
+        "avg_libc_throughput_kops": avg_libc_throughput_kops,
+    }
+
+
 def parse_mdriver_output(output: str) -> Dict[str, Optional[float]]:
     correct: Optional[int] = None
     perfidx: Optional[float] = None
@@ -398,6 +454,63 @@ def stable_value_or_none(values: List[int]) -> Optional[int]:
     return int(values[0])
 
 
+def compute_score(
+    util_percent: Optional[float],
+    throughput_kops: Optional[float],
+    score_config: Optional[Dict[str, float]],
+) -> Optional[float]:
+    if util_percent is None or throughput_kops is None or score_config is None:
+        return None
+    avg_libc_throughput_kops = score_config["avg_libc_throughput_kops"]
+    if avg_libc_throughput_kops <= 0:
+        raise BenchmarkError("avg_libc_throughput_kops must be positive")
+    util_weight = score_config["util_weight"]
+    throughput_weight = score_config["throughput_weight"]
+    utilization = float(util_percent) / 100.0
+    throughput_ratio = min(float(throughput_kops) / avg_libc_throughput_kops, 1.0)
+    return round((util_weight * utilization + throughput_weight * throughput_ratio) * 100.0, 1)
+
+
+def compute_throughput_kops(total_ops: Optional[float], total_secs: Optional[float]) -> Optional[float]:
+    if total_ops is None or total_secs is None or total_secs <= 0:
+        return None
+    return float(total_ops) / float(total_secs) / 1000.0
+
+
+def format_optional_float(value: object, digits: int = 3) -> object:
+    if value is None or value == "":
+        return ""
+    return ("{:.%df}" % digits).format(float(value))
+
+
+def score_from_result(
+    result: Dict[str, object],
+    score_config: Optional[Dict[str, float]],
+) -> Optional[float]:
+    explicit_score = result.get("score")
+    if explicit_score is not None:
+        return float(explicit_score)
+    perfidx = result.get("perfidx")
+    if perfidx is not None:
+        return float(perfidx)
+    return compute_score(
+        util_percent=float(result["util_percent"]) if result.get("util_percent") is not None else None,
+        throughput_kops=float(result["throughput_kops"]) if result.get("throughput_kops") is not None else None,
+        score_config=score_config,
+    )
+
+
+def normalize_results(results: List[Dict[str, object]], score_config: Optional[Dict[str, float]]) -> List[Dict[str, object]]:
+    normalized: List[Dict[str, object]] = []
+    for result in results:
+        item = dict(result)
+        score = score_from_result(item, score_config)
+        if score is not None:
+            item["score"] = score
+        normalized.append(item)
+    return normalized
+
+
 def sort_results(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
     status_rank = {
         "OK": 0,
@@ -410,14 +523,20 @@ def sort_results(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
         "DIRTY_REPO": 7,
         "SYNC_FAIL": 8,
     }
+
+    def sort_key(result: Dict[str, object]) -> tuple:
+        score = score_from_result(result, None)
+        throughput = result.get("throughput_kops")
+        return (
+            status_rank.get(str(result.get("status")), 99),
+            -(score if score is not None else -1.0),
+            -(float(throughput) if throughput is not None else -1.0),
+            str(result.get("alias")),
+        )
+
     return sorted(
         results,
-        key=lambda result: (
-            status_rank.get(str(result.get("status")), 99),
-            -(float(result.get("perfidx")) if result.get("perfidx") is not None else -1.0),
-            -(float(result.get("throughput_kops")) if result.get("throughput_kops") is not None else -1.0),
-            str(result.get("alias")),
-        ),
+        key=sort_key,
     )
 
 
@@ -427,12 +546,17 @@ def render_harness_label(diff_count: int) -> str:
     return "DIFF({})".format(diff_count)
 
 
-def to_csv_rows(results: List[Dict[str, object]], expected_traces: int) -> List[Dict[str, object]]:
+def to_csv_rows(
+    results: List[Dict[str, object]],
+    expected_traces: int,
+    score_config: Optional[Dict[str, float]],
+) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     rank = 1
     for result in sort_results(results):
         ranked = result.get("status") == "OK"
         correct = result.get("correct")
+        score = score_from_result(result, score_config)
         correct_label = ""
         if correct is not None:
             correct_label = "{}/{}".format(correct, expected_traces)
@@ -443,8 +567,9 @@ def to_csv_rows(results: List[Dict[str, object]], expected_traces: int) -> List[
             "harness": render_harness_label(int(result.get("harness_diff_count", 0))),
             "correct": correct_label,
             "util_percent": "" if result.get("util_percent") is None else result.get("util_percent"),
-            "throughput_kops": "" if result.get("throughput_kops") is None else result.get("throughput_kops"),
-            "perfidx": "" if result.get("perfidx") is None else result.get("perfidx"),
+            "throughput_kops": format_optional_float(result.get("throughput_kops")),
+            "score": format_optional_float(score, digits=1),
+            "perfidx": format_optional_float(result.get("perfidx"), digits=1),
             "branch": result.get("branch", ""),
             "commit": result.get("commit", ""),
             "repo_url": result.get("repo_url", ""),
@@ -456,8 +581,14 @@ def to_csv_rows(results: List[Dict[str, object]], expected_traces: int) -> List[
     return rows
 
 
-def write_summary_files(run_dir: Path, results: List[Dict[str, object]], expected_traces: int) -> None:
-    rows = to_csv_rows(results, expected_traces)
+def write_summary_files(
+    run_dir: Path,
+    results: List[Dict[str, object]],
+    expected_traces: int,
+    score_config: Optional[Dict[str, float]] = None,
+) -> None:
+    normalized_results = normalize_results(results, score_config)
+    rows = to_csv_rows(normalized_results, expected_traces, score_config)
     csv_path = run_dir / "summary.csv"
     md_path = run_dir / "summary.md"
     json_path = run_dir / "results.json"
@@ -470,6 +601,7 @@ def write_summary_files(run_dir: Path, results: List[Dict[str, object]], expecte
             "correct",
             "util_percent",
             "throughput_kops",
+            "score",
             "perfidx",
             "branch",
             "commit",
@@ -482,22 +614,30 @@ def write_summary_files(run_dir: Path, results: List[Dict[str, object]], expecte
     md_lines = [
         "# Benchmark Summary",
         "",
-        "| rank | alias | status | harness | correct | util(%) | Kops | perfidx | branch | commit |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| rank | alias | status | harness | correct | util(%) | Kops | score | perfidx | branch | commit |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         md_lines.append(
-            "| {rank} | {alias} | {status} | {harness} | {correct} | {util_percent} | {throughput_kops} | {perfidx} | {branch} | {commit} |".format(
+            "| {rank} | {alias} | {status} | {harness} | {correct} | {util_percent} | {throughput_kops} | {score} | {perfidx} | {branch} | {commit} |".format(
                 **row
             )
         )
     md_lines.append("")
     md_lines.append("expected_traces: {}".format(expected_traces))
+    if score_config is not None:
+        md_lines.append(
+            "score_formula: score == perfidx, util_weight={:.2f}, throughput_weight={:.2f}, throughput_cap_kops={:.1f}".format(
+                score_config["util_weight"],
+                score_config["throughput_weight"],
+                score_config["avg_libc_throughput_kops"],
+            )
+        )
     md_lines.append("")
     md_lines.append("generated_at: {}".format(datetime.now().isoformat(timespec="seconds")))
     md_lines.append("")
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
-    write_json(json_path, results)
+    write_json(json_path, normalized_results)
 
 
 def format_completed_process(command: List[str], completed: subprocess.CompletedProcess) -> str:
@@ -520,6 +660,7 @@ def result_from_attempts(
     result = dict(base_result)
     result["attempts"] = attempts
     successful = [attempt for attempt in attempts if attempt.get("status") == "OK"]
+    failed_attempt = next((attempt for attempt in attempts if attempt.get("status") != "OK"), None)
     if not attempts:
         return result
     if not successful:
@@ -528,10 +669,24 @@ def result_from_attempts(
         result["util_percent"] = None
         result["throughput_kops"] = None
         result["perfidx"] = None
+        if attempts[0].get("error") is not None:
+            result["error"] = attempts[0].get("error")
         return result
     correct_values = [int(attempt["correct"]) for attempt in successful if attempt.get("correct") is not None]
     util_values = [int(attempt["util_percent"]) for attempt in successful if attempt.get("util_percent") is not None]
-    kops_values = [int(attempt["total_kops"]) for attempt in successful if attempt.get("total_kops") is not None]
+    total_ops_values = [float(attempt["total_ops"]) for attempt in successful if attempt.get("total_ops") is not None]
+    total_secs_values = [float(attempt["total_secs"]) for attempt in successful if attempt.get("total_secs") is not None]
+    kops_values = [
+        throughput
+        for throughput in (
+            compute_throughput_kops(
+                total_ops=float(attempt["total_ops"]) if attempt.get("total_ops") is not None else None,
+                total_secs=float(attempt["total_secs"]) if attempt.get("total_secs") is not None else None,
+            )
+            for attempt in successful
+        )
+        if throughput is not None
+    ]
     perf_values = [float(attempt["perfidx"]) for attempt in successful if attempt.get("perfidx") is not None]
     unstable = len(successful) != len(attempts) or len(set(correct_values)) > 1
     if unstable:
@@ -541,9 +696,13 @@ def result_from_attempts(
     else:
         status = "OK"
     result["status"] = status
+    if failed_attempt is not None and failed_attempt.get("error") is not None:
+        result["error"] = failed_attempt.get("error")
     result["correct"] = stable_value_or_none(correct_values)
     result["util_percent"] = int(median_or_none([float(value) for value in util_values])) if util_values else None
-    result["throughput_kops"] = int(median_or_none([float(value) for value in kops_values])) if kops_values else None
+    result["total_ops"] = int(median_or_none(total_ops_values)) if total_ops_values else None
+    result["total_secs"] = median_or_none(total_secs_values)
+    result["throughput_kops"] = round(median_or_none(kops_values), 3) if kops_values else None
     result["perfidx"] = median_or_none(perf_values)
     return result
 

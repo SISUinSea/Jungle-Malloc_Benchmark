@@ -1,7 +1,7 @@
 import argparse
 import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from benchmark_lib import (
     BenchmarkError,
@@ -15,6 +15,7 @@ from benchmark_lib import (
     format_completed_process,
     git_output,
     init_base_result,
+    parse_score_config,
     parse_default_trace_count,
     parse_mdriver_output,
     read_participants,
@@ -80,6 +81,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="mark participant as failed when reference harness diff is detected",
     )
+    parser.add_argument(
+        "--build-timeout",
+        type=float,
+        default=30.0,
+        help="timeout in seconds for each make command; <= 0 disables timeout",
+    )
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=20.0,
+        help="timeout in seconds for each mdriver run; <= 0 disables timeout",
+    )
     return parser.parse_args()
 
 
@@ -100,23 +113,40 @@ def build_worktree(
     return work_lab_dir
 
 
-def run_single_attempt(work_lab_dir: Path, log_path: Path) -> Dict[str, object]:
+def normalize_timeout(value: float) -> Optional[float]:
+    if value <= 0:
+        return None
+    return value
+
+
+def command_error(command_name: str, returncode: int, timeout_seconds: Optional[float]) -> str:
+    if returncode == 124 and timeout_seconds is not None:
+        return "{} timed out after {} seconds".format(command_name, timeout_seconds)
+    return "{} failed".format(command_name)
+
+
+def run_single_attempt(
+    work_lab_dir: Path,
+    log_path: Path,
+    build_timeout: Optional[float],
+    run_timeout: Optional[float],
+) -> Dict[str, object]:
     log_chunks: List[str] = []
-    clean = run_command(["make", "clean"], cwd=work_lab_dir, check=False)
+    clean = run_command(["make", "clean"], cwd=work_lab_dir, check=False, timeout_seconds=build_timeout)
     log_chunks.append(format_completed_process(["make", "clean"], clean))
     if clean.returncode != 0:
         log_path.write_text("".join(log_chunks), encoding="utf-8")
-        return {"status": "BUILD_FAIL", "error": "make clean failed"}
-    build = run_command(["make"], cwd=work_lab_dir, check=False)
+        return {"status": "BUILD_FAIL", "error": command_error("make clean", clean.returncode, build_timeout)}
+    build = run_command(["make"], cwd=work_lab_dir, check=False, timeout_seconds=build_timeout)
     log_chunks.append(format_completed_process(["make"], build))
     if build.returncode != 0:
         log_path.write_text("".join(log_chunks), encoding="utf-8")
-        return {"status": "BUILD_FAIL", "error": "make failed"}
-    mdriver = run_command(["./mdriver", "-v", "-g"], cwd=work_lab_dir, check=False)
+        return {"status": "BUILD_FAIL", "error": command_error("make", build.returncode, build_timeout)}
+    mdriver = run_command(["./mdriver", "-v", "-g"], cwd=work_lab_dir, check=False, timeout_seconds=run_timeout)
     log_chunks.append(format_completed_process(["./mdriver", "-v", "-g"], mdriver))
     log_path.write_text("".join(log_chunks), encoding="utf-8")
     if mdriver.returncode != 0:
-        return {"status": "RUN_FAIL", "error": "mdriver returned non-zero"}
+        return {"status": "RUN_FAIL", "error": command_error("./mdriver -v -g", mdriver.returncode, run_timeout)}
     parsed = parse_mdriver_output(mdriver.stdout)
     if parsed.get("correct") is None or parsed.get("perfidx") is None:
         return {"status": "RUN_FAIL", "error": "failed to parse mdriver output"}
@@ -133,6 +163,8 @@ def run_participant(
     mode: str,
     expected_traces: int,
     fail_on_harness_diff: bool,
+    build_timeout: Optional[float],
+    run_timeout: Optional[float],
 ) -> Dict[str, object]:
     participant_dir = run_dir / participant.alias
     ensure_dir(participant_dir)
@@ -172,7 +204,12 @@ def run_participant(
             source_mm_path=source_mm_path,
             worktree_root=worktree_root,
         )
-        attempt_result = run_single_attempt(work_lab_dir, participant_dir / "attempt-{:02d}.log".format(attempt_number))
+        attempt_result = run_single_attempt(
+            work_lab_dir,
+            participant_dir / "attempt-{:02d}.log".format(attempt_number),
+            build_timeout=build_timeout,
+            run_timeout=run_timeout,
+        )
         attempt_result["attempt"] = attempt_number
         attempts.append(attempt_result)
         if attempt_result["status"] in {"BUILD_FAIL", "RUN_FAIL"}:
@@ -186,9 +223,12 @@ def main() -> int:
     try:
         if args.repeat < 1:
             raise BenchmarkError("--repeat must be at least 1")
+        build_timeout = normalize_timeout(args.build_timeout)
+        run_timeout = normalize_timeout(args.run_timeout)
         participants = read_participants(args.participants)
         benchmark_base = args.benchmark_base.resolve()
         expected_traces = parse_default_trace_count(benchmark_base / "config.h")
+        score_config = parse_score_config(benchmark_base / "config.h")
         if args.skip_sync:
             sync_records = []
             for participant in participants:
@@ -237,10 +277,16 @@ def main() -> int:
             {
                 "mode": args.mode,
                 "repeat": args.repeat,
+                "build_timeout": build_timeout,
+                "run_timeout": run_timeout,
                 "participants_csv": str(args.participants),
                 "repos_dir": str(args.repos_dir),
                 "benchmark_base": str(benchmark_base),
                 "expected_traces": expected_traces,
+                "score_util_weight": score_config["util_weight"],
+                "score_throughput_weight": score_config["throughput_weight"],
+                "score_avg_libc_throughput_ops": score_config["avg_libc_throughput_ops"],
+                "score_avg_libc_throughput_kops": score_config["avg_libc_throughput_kops"],
                 "skip_sync": args.skip_sync,
                 "fail_on_harness_diff": args.fail_on_harness_diff,
             },
@@ -258,9 +304,11 @@ def main() -> int:
                 mode=args.mode,
                 expected_traces=expected_traces,
                 fail_on_harness_diff=args.fail_on_harness_diff,
+                build_timeout=build_timeout,
+                run_timeout=run_timeout,
             )
             results.append(result)
-        write_summary_files(run_dir, results, expected_traces)
+        write_summary_files(run_dir, results, expected_traces, score_config=score_config)
     except BenchmarkError as exc:
         print("ERROR:", exc)
         return 1
